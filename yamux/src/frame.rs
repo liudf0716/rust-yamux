@@ -98,6 +98,16 @@ impl Frame<Data> {
         })
     }
 
+    pub fn close_stream(id: StreamId, ack: bool) -> Self {
+        let mut header = Header::data(id, 0);
+        header.fin();
+        if ack {
+            header.ack()
+        }
+
+        Frame::new(header)
+    }
+
     pub fn body(&self) -> &[u8] {
         &self.body
     }
@@ -119,6 +129,22 @@ impl Frame<WindowUpdate> {
             header: Header::window_update(id, credit),
             body: Vec::new(),
         }
+    }
+}
+
+impl Frame<Ping> {
+    pub fn ping(nonce: u32) -> Self {
+        let mut header = Header::ping(nonce);
+        header.syn();
+
+        Frame {
+            header,
+            body: Vec::new(),
+        }
+    }
+
+    pub fn nonce(&self) -> u32 {
+        self.header.nonce()
     }
 }
 

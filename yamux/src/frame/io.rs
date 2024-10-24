@@ -20,6 +20,13 @@ use std::{
     task::{Context, Poll},
 };
 
+/// Maximum Yamux frame body length
+///
+/// Limits the amount of bytes a remote can cause the local node to allocate at once when reading.
+///
+/// Chosen based on intuition in past iterations.
+const MAX_FRAME_BODY_LEN: usize = 1 * crate::MIB;
+
 /// A [`Stream`] and writer of [`Frame`] values.
 #[derive(Debug)]
 pub(crate) struct Io<T> {
@@ -27,17 +34,15 @@ pub(crate) struct Io<T> {
     io: T,
     read_state: ReadState,
     write_state: WriteState,
-    max_body_len: usize,
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
-    pub(crate) fn new(id: Id, io: T, max_frame_body_len: usize) -> Self {
+    pub(crate) fn new(id: Id, io: T) -> Self {
         Io {
             id,
             io,
             read_state: ReadState::Init,
             write_state: WriteState::Init,
-            max_body_len: max_frame_body_len,
         }
     }
 }
@@ -97,7 +102,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
                         }
                         *offset += n;
                         if *offset == header.len() {
-                            if buffer.len() > 0 {
+                            if !buffer.is_empty() {
                                 let buffer = std::mem::take(buffer);
                                 this.write_state = WriteState::Body { buffer, offset: 0 };
                             } else {
@@ -171,7 +176,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
     type Item = Result<Frame<()>, FrameDecodeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut this = &mut *self;
+        let this = &mut *self;
         loop {
             log::trace!("{}: read: {:?}", this.id, this.read_state);
             match this.read_state {
@@ -186,7 +191,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
                     ref mut buffer,
                 } => {
                     if *offset == header::HEADER_SIZE {
-                        let header = match header::decode(&buffer) {
+                        let header = match header::decode(buffer) {
                             Ok(hd) => hd,
                             Err(e) => return Poll::Ready(Some(Err(e.into()))),
                         };
@@ -200,7 +205,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
 
                         let body_len = header.len().val() as usize;
 
-                        if body_len > this.max_body_len {
+                        if body_len > MAX_FRAME_BODY_LEN {
                             return Poll::Ready(Some(Err(FrameDecodeError::FrameTooLarge(
                                 body_len,
                             ))));
@@ -349,7 +354,7 @@ mod tests {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
                 let id = crate::connection::Id::random();
-                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()), f.body.len());
+                let mut io = Io::new(id, futures::io::Cursor::new(Vec::new()));
                 if io.send(f.clone()).await.is_err() {
                     return false;
                 }

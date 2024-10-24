@@ -1,3 +1,72 @@
+# 0.13.4
+
+- Fix sending pending frames after closing. See [PR 194](https://github.com/libp2p/rust-yamux/pull/194).
+
+# 0.13.3
+
+- Wake up readers after setting the state to RecvClosed to not miss EOF.
+  See [PR 190](https://github.com/libp2p/rust-yamux/pull/190).
+
+- Use `web-time` instead of `instant`.
+  See [PR 191](https://github.com/libp2p/rust-yamux/pull/191).
+
+# 0.13.2
+
+- Bound `Active`'s `pending_frames` to enforce backpressure. 
+  See [460baf2](https://github.com/libp2p/rust-yamux/commit/460baf2ccb7d5982b266cb3cb9c0bdf75b4fb779)
+  
+# 0.13.1
+
+- Fix WASM support using `instant::{Duration, Instant}` instead of `std::time::{Duration, Instant}`.
+  See [PR 179](https://github.com/libp2p/rust-yamux/pull/179).
+
+# 0.13.0
+
+- Introduce dynamic stream receive window auto-tuning.
+  While low-resourced deployments maintain the benefit of small buffers, high resource deployments eventually end-up with a window of roughly the bandwidth-delay-product (ideal) and are thus able to use the entire available bandwidth.
+  See [PR 176](https://github.com/libp2p/rust-yamux/pull/176) for performance results and details on the implementation.
+- Remove `WindowUpdateMode`.
+  Behavior will always be `WindowUpdateMode::OnRead`, thus enabling flow-control and enforcing backpressure.
+  See [PR 178](https://github.com/libp2p/rust-yamux/pull/178).
+
+# 0.12.1
+
+- Deprecate `WindowUpdateMode::OnReceive`.
+  It does not enforce flow-control, i.e. breaks backpressure.
+  Use `WindowUpdateMode::OnRead` instead.
+  See [PR #177](https://github.com/libp2p/rust-yamux/pull/177).
+
+# 0.12.0
+
+- Remove `Control` and `ControlledConnection`.
+  Users have to move to the `poll_` functions of `Connection`.
+  See [PR #164](https://github.com/libp2p/rust-yamux/pull/164).
+
+- Fix a bug where `Stream`s would not be dropped until their corresponding `Connection` was dropped.
+  See [PR #167](https://github.com/libp2p/rust-yamux/pull/167).
+
+# 0.11.1
+
+- Avoid race condition between pending frames and closing stream.
+  See [PR 156].
+
+[PR 156]: https://github.com/libp2p/rust-yamux/pull/156
+
+# 0.11.0
+
+- Remove `Connection::control` in favor of `Control::new`.
+  Remove `Connection::next_stream` in favor of `Connection::poll_next_inbound`.
+  See [PR 142].
+
+[PR 142]: https://github.com/libp2p/rust-yamux/pull/142
+
+# 0.10.2
+
+- Process command or socket result immediately and thereby no longer accessing
+  the socket after it returned an error. See [PR 138] for details.
+
+[PR 138]: https://github.com/libp2p/rust-yamux/pull/138
+
 # 0.10.1
 
 - Update `parking_lot` dependency. See [PR 126].

@@ -8,23 +8,25 @@
 // at https://www.apache.org/licenses/LICENSE-2.0 and a copy of the MIT license
 // at https://opensource.org/licenses/MIT.
 
+use crate::connection::rtt::Rtt;
+use crate::frame::header::ACK;
 use crate::{
     chunks::Chunks,
-    connection::{self, StreamCommand},
+    connection::{self, rtt, StreamCommand},
     frame::{
         header::{Data, Header, StreamId, WindowUpdate},
         Frame,
     },
-    Config, WindowUpdateMode,
+    Config, DEFAULT_CREDIT,
 };
+use flow_control::FlowController;
 use futures::{
     channel::mpsc,
     future::Either,
     io::{AsyncRead, AsyncWrite},
-    ready,
+    ready, SinkExt,
 };
 use parking_lot::{Mutex, MutexGuard};
-use std::convert::TryInto;
 use std::{
     fmt, io,
     pin::Pin,
@@ -32,11 +34,24 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
+mod flow_control;
+
 /// The state of a Yamux stream.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum State {
     /// Open bidirectionally.
-    Open,
+    Open {
+        /// Whether the stream is acknowledged.
+        ///
+        /// For outbound streams, this tracks whether the remote has acknowledged our stream.
+        /// For inbound streams, this tracks whether we have acknowledged the stream to the remote.
+        ///
+        /// This starts out with `false` and is set to `true` when we receive or send an `ACK` flag for this stream.
+        /// We may also directly transition:
+        /// - from `Open` to `RecvClosed` if the remote immediately sends `FIN`.
+        /// - from `Open` to `Closed` if the remote immediately sends `RST`.
+        acknowledged: bool,
+    },
     /// Open for incoming messages.
     SendClosed,
     /// Open for outgoing messages.
@@ -48,20 +63,12 @@ pub enum State {
 impl State {
     /// Can we receive messages over this stream?
     pub fn can_read(self) -> bool {
-        if let State::RecvClosed | State::Closed = self {
-            false
-        } else {
-            true
-        }
+        !matches!(self, State::RecvClosed | State::Closed)
     }
 
     /// Can we send messages over this stream?
     pub fn can_write(self) -> bool {
-        if let State::SendClosed | State::Closed = self {
-            false
-        } else {
-            true
-        }
+        !matches!(self, State::SendClosed | State::Closed)
     }
 }
 
@@ -78,8 +85,8 @@ pub(crate) enum Flag {
 
 /// A multiplexed Yamux stream.
 ///
-/// Streams are created either outbound via [`crate::Control::open_stream`]
-/// or inbound via [`crate::Connection::next_stream`].
+/// Streams are created either outbound via [`crate::Connection::poll_new_outbound`]
+/// or inbound via [`crate::Connection::poll_next_inbound`].
 ///
 /// `Stream` implements [`AsyncRead`] and [`AsyncWrite`] and also
 /// [`futures::stream::Stream`].
@@ -108,21 +115,52 @@ impl fmt::Display for Stream {
 }
 
 impl Stream {
-    pub(crate) fn new(
+    pub(crate) fn new_inbound(
         id: StreamId,
         conn: connection::Id,
         config: Arc<Config>,
-        window: u32,
-        credit: u32,
+        send_window: u32,
         sender: mpsc::Sender<StreamCommand>,
+        rtt: rtt::Rtt,
+        accumulated_max_stream_windows: Arc<Mutex<usize>>,
     ) -> Self {
-        Stream {
+        Self {
             id,
             conn,
             config: config.clone(),
             sender,
-            flag: Flag::None,
-            shared: Arc::new(Mutex::new(Shared::new(window, credit, config))),
+            flag: Flag::Ack,
+            shared: Arc::new(Mutex::new(Shared::new(
+                DEFAULT_CREDIT,
+                send_window,
+                accumulated_max_stream_windows,
+                rtt,
+                config,
+            ))),
+        }
+    }
+
+    pub(crate) fn new_outbound(
+        id: StreamId,
+        conn: connection::Id,
+        config: Arc<Config>,
+        sender: mpsc::Sender<StreamCommand>,
+        rtt: rtt::Rtt,
+        accumulated_max_stream_windows: Arc<Mutex<usize>>,
+    ) -> Self {
+        Self {
+            id,
+            conn,
+            config: config.clone(),
+            sender,
+            flag: Flag::Syn,
+            shared: Arc::new(Mutex::new(Shared::new(
+                DEFAULT_CREDIT,
+                DEFAULT_CREDIT,
+                accumulated_max_stream_windows,
+                rtt,
+                config,
+            ))),
         }
     }
 
@@ -131,33 +169,25 @@ impl Stream {
         self.id
     }
 
-    /// Set the flag that should be set on the next outbound frame header.
-    pub(crate) fn set_flag(&mut self, flag: Flag) {
-        self.flag = flag
+    pub fn is_write_closed(&self) -> bool {
+        matches!(self.shared().state(), State::SendClosed)
     }
 
-    /// Get this stream's state.
-    pub(crate) fn state(&self) -> State {
-        self.shared().state()
+    pub fn is_closed(&self) -> bool {
+        matches!(self.shared().state(), State::Closed)
     }
 
-    pub(crate) fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.shared)
+    /// Whether we are still waiting for the remote to acknowledge this stream.
+    pub fn is_pending_ack(&self) -> bool {
+        self.shared().is_pending_ack()
     }
 
     pub(crate) fn shared(&self) -> MutexGuard<'_, Shared> {
         self.shared.lock()
     }
 
-    pub(crate) fn clone(&self) -> Self {
-        Stream {
-            id: self.id,
-            conn: self.conn,
-            config: self.config.clone(),
-            sender: self.sender.clone(),
-            flag: self.flag,
-            shared: self.shared.clone(),
-        }
+    pub(crate) fn clone_shared(&self) -> Arc<Mutex<Shared>> {
+        self.shared.clone()
     }
 
     fn write_zero_err(&self) -> io::Error {
@@ -183,30 +213,25 @@ impl Stream {
     /// Send new credit to the sending side via a window update message if
     /// permitted.
     fn send_window_update(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
-        // When using [`WindowUpdateMode::OnReceive`] window update messages are
-        // send early on data receival (see [`crate::Connection::on_frame`]).
-        if matches!(self.config.window_update_mode, WindowUpdateMode::OnReceive) {
+        if !self.shared.lock().state.can_read() {
             return Poll::Ready(Ok(()));
         }
 
-        let mut shared = self.shared.lock();
+        ready!(self
+            .sender
+            .poll_ready(cx)
+            .map_err(|_| self.write_zero_err())?);
 
-        if let Some(credit) = shared.next_window_update() {
-            ready!(self
-                .sender
-                .poll_ready(cx)
-                .map_err(|_| self.write_zero_err())?);
+        let Some(credit) = self.shared.lock().next_window_update() else {
+            return Poll::Ready(Ok(()));
+        };
 
-            shared.window += credit;
-            drop(shared);
-
-            let mut frame = Frame::window_update(self.id, credit).right();
-            self.add_flag(frame.header_mut());
-            let cmd = StreamCommand::SendFrame(frame);
-            self.sender
-                .start_send(cmd)
-                .map_err(|_| self.write_zero_err())?;
-        }
+        let mut frame = Frame::window_update(self.id, credit).right();
+        self.add_flag(frame.header_mut());
+        let cmd = StreamCommand::SendFrame(frame);
+        self.sender
+            .start_send(cmd)
+            .map_err(|_| self.write_zero_err())?;
 
         Poll::Ready(Ok(()))
     }
@@ -299,7 +324,7 @@ impl AsyncRead for Stream {
                 continue;
             }
             let k = std::cmp::min(chunk.len(), buf.len() - n);
-            (&mut buf[n..n + k]).copy_from_slice(&chunk.as_ref()[..k]);
+            buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
             n += k;
             chunk.advance(k);
             if n == buf.len() {
@@ -342,20 +367,36 @@ impl AsyncWrite for Stream {
                 log::debug!("{}/{}: can no longer write", self.conn, self.id);
                 return Poll::Ready(Err(self.write_zero_err()));
             }
-            if shared.credit == 0 {
+            if shared.send_window() == 0 {
                 log::trace!("{}/{}: no more credit left", self.conn, self.id);
                 shared.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            let k = std::cmp::min(shared.credit as usize, buf.len());
-            let k = std::cmp::min(k, self.config.split_send_size);
-            shared.credit = shared.credit.saturating_sub(k as u32);
-            Vec::from(&buf[..k])
+            let k = std::cmp::min(
+                shared.send_window(),
+                buf.len().try_into().unwrap_or(u32::MAX),
+            );
+            let k = std::cmp::min(
+                k,
+                self.config.split_send_size.try_into().unwrap_or(u32::MAX),
+            );
+            shared.consume_send_window(k);
+            Vec::from(&buf[..k as usize])
         };
         let n = body.len();
         let mut frame = Frame::data(self.id, body).expect("body <= u32::MAX").left();
         self.add_flag(frame.header_mut());
         log::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
+
+        // technically, the frame hasn't been sent yet on the wire but from the perspective of this data structure, we've queued the frame for sending
+        // We are tracking this information:
+        // a) to be consistent with outbound streams
+        // b) to correctly test our behaviour around timing of when ACKs are sent. See `ack_timing.rs` test.
+        if frame.header().flags().contains(ACK) {
+            self.shared()
+                .update_state(self.conn, self.id, State::Open { acknowledged: true });
+        }
+
         let cmd = StreamCommand::SendFrame(frame);
         self.sender
             .start_send(cmd)
@@ -363,12 +404,14 @@ impl AsyncWrite for Stream {
         Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.sender
+            .poll_flush_unpin(cx)
+            .map_err(|_| self.write_zero_err())
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        if self.state() == State::Closed {
+        if self.is_closed() {
             return Poll::Ready(Ok(()));
         }
         ready!(self
@@ -382,7 +425,7 @@ impl AsyncWrite for Stream {
             false
         };
         log::trace!("{}/{}: close", self.conn, self.id);
-        let cmd = StreamCommand::CloseStream { id: self.id, ack };
+        let cmd = StreamCommand::CloseStream { ack };
         self.sender
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
@@ -395,24 +438,34 @@ impl AsyncWrite for Stream {
 #[derive(Debug)]
 pub(crate) struct Shared {
     state: State,
-    pub(crate) window: u32,
-    pub(crate) credit: u32,
+    flow_controller: FlowController,
     pub(crate) buffer: Chunks,
     pub(crate) reader: Option<Waker>,
     pub(crate) writer: Option<Waker>,
-    config: Arc<Config>,
 }
 
 impl Shared {
-    fn new(window: u32, credit: u32, config: Arc<Config>) -> Self {
+    fn new(
+        receive_window: u32,
+        send_window: u32,
+        accumulated_max_stream_windows: Arc<Mutex<usize>>,
+        rtt: Rtt,
+        config: Arc<Config>,
+    ) -> Self {
         Shared {
-            state: State::Open,
-            window,
-            credit,
+            state: State::Open {
+                acknowledged: false,
+            },
+            flow_controller: FlowController::new(
+                receive_window,
+                send_window,
+                accumulated_max_stream_windows,
+                rtt,
+                config,
+            ),
             buffer: Chunks::new(),
             reader: None,
             writer: None,
-            config,
         }
     }
 
@@ -433,19 +486,19 @@ impl Shared {
 
         match (current, next) {
             (Closed, _) => {}
-            (Open, _) => self.state = next,
+            (Open { .. }, _) => self.state = next,
             (RecvClosed, Closed) => self.state = Closed,
-            (RecvClosed, Open) => {}
+            (RecvClosed, Open { .. }) => {}
             (RecvClosed, RecvClosed) => {}
             (RecvClosed, SendClosed) => self.state = Closed,
             (SendClosed, Closed) => self.state = Closed,
-            (SendClosed, Open) => {}
+            (SendClosed, Open { .. }) => {}
             (SendClosed, RecvClosed) => self.state = Closed,
             (SendClosed, SendClosed) => {}
         }
 
         log::trace!(
-            "{}/{}: update state: ({:?} {:?} {:?})",
+            "{}/{}: update state: (from {:?} to {:?} -> {:?})",
             cid,
             sid,
             current,
@@ -456,42 +509,37 @@ impl Shared {
         current // Return the previous stream state for informational purposes.
     }
 
-    /// Calculate the number of additional window bytes the receiving side
-    /// should grant the sending side via a window update message.
-    ///
-    /// Returns `None` if too small to justify a window update message.
-    ///
-    /// Note: Once a caller successfully sent a window update message, the
-    /// locally tracked window size needs to be updated manually by the caller.
     pub(crate) fn next_window_update(&mut self) -> Option<u32> {
-        if !self.state.can_read() {
-            return None;
-        }
+        self.flow_controller.next_window_update(self.buffer.len())
+    }
 
-        let new_credit = match self.config.window_update_mode {
-            WindowUpdateMode::OnReceive => {
-                debug_assert!(self.config.receive_window >= self.window);
-                let bytes_received = self.config.receive_window.saturating_sub(self.window);
-                bytes_received
+    /// Whether we are still waiting for the remote to acknowledge this stream.
+    pub fn is_pending_ack(&self) -> bool {
+        matches!(
+            self.state(),
+            State::Open {
+                acknowledged: false
             }
-            WindowUpdateMode::OnRead => {
-                debug_assert!(self.config.receive_window >= self.window);
-                let bytes_received = self.config.receive_window.saturating_sub(self.window);
-                let buffer_len: u32 = self.buffer.len().try_into().unwrap_or(std::u32::MAX);
-                let bytes_read = bytes_received.saturating_sub(buffer_len);
-                bytes_read
-            }
-        };
+        )
+    }
 
-        // Send WindowUpdate message when half or more of the configured receive
-        // window can be granted as additional credit to the sender.
-        //
-        // See https://github.com/paritytech/yamux/issues/100 for a detailed
-        // discussion.
-        if new_credit >= self.config.receive_window / 2 {
-            Some(new_credit)
-        } else {
-            None
-        }
+    pub(crate) fn send_window(&self) -> u32 {
+        self.flow_controller.send_window()
+    }
+
+    pub(crate) fn consume_send_window(&mut self, i: u32) {
+        self.flow_controller.consume_send_window(i)
+    }
+
+    pub(crate) fn increase_send_window_by(&mut self, i: u32) {
+        self.flow_controller.increase_send_window_by(i)
+    }
+
+    pub(crate) fn receive_window(&self) -> u32 {
+        self.flow_controller.receive_window()
+    }
+
+    pub(crate) fn consume_receive_window(&mut self, i: u32) {
+        self.flow_controller.consume_receive_window(i)
     }
 }
